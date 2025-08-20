@@ -1,0 +1,587 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.flink.state.backend.aws.util;
+
+import org.apache.flink.annotation.Internal;
+import org.apache.flink.annotation.VisibleForTesting;
+import org.apache.flink.state.backend.aws.config.AWSConfigConstants;
+import org.apache.flink.state.backend.aws.config.AWSConfigConstants.CredentialProvider;
+import org.apache.flink.state.backend.aws.config.AWSConfigOptions;
+import org.apache.flink.util.ExceptionUtils;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import software.amazon.awssdk.arns.Arn;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.EnvironmentVariableCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.ProfileCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.SystemPropertyCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.WebIdentityTokenFileCredentialsProvider;
+import software.amazon.awssdk.http.Protocol;
+import software.amazon.awssdk.http.SdkHttpClient;
+import software.amazon.awssdk.http.SdkHttpConfigurationOption;
+import software.amazon.awssdk.http.apache.ApacheHttpClient;
+import software.amazon.awssdk.http.async.SdkAsyncHttpClient;
+import software.amazon.awssdk.http.nio.netty.Http2Configuration;
+import software.amazon.awssdk.http.nio.netty.NettyNioAsyncHttpClient;
+import software.amazon.awssdk.profiles.ProfileFile;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.sts.StsClient;
+import software.amazon.awssdk.services.sts.StsClientBuilder;
+import software.amazon.awssdk.services.sts.auth.StsAssumeRoleCredentialsProvider;
+import software.amazon.awssdk.services.sts.model.AssumeRoleRequest;
+import software.amazon.awssdk.utils.AttributeMap;
+import software.amazon.awssdk.utils.SdkAutoCloseable;
+
+import java.lang.reflect.InvocationTargetException;
+import java.net.URI;
+import java.nio.file.Paths;
+import java.time.Duration;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Properties;
+import java.util.regex.Pattern;
+
+/**
+ * General utilities for Amazon Web Services integration.
+ *
+ * <p>This class provides common functionality for AWS service integration, including:
+ * <ul>
+ *   <li>Credential provider management and configuration</li>
+ *   <li>Region handling and validation</li>
+ *   <li>HTTP client creation and configuration</li>
+ *   <li>AWS resource validation</li>
+ * </ul>
+ *
+ * <p>The utilities in this class are used by the AWS state backends and other
+ * AWS-integrated components in Flink to ensure consistent handling of AWS
+ * credentials, regions, and client configurations.
+ *
+ * <p>Example usage:
+ * <pre>{@code
+ * Properties configProps = new Properties();
+ * configProps.setProperty(AWSConfigConstants.AWS_REGION, "us-west-2");
+ * configProps.setProperty(AWSConfigConstants.AWS_CREDENTIALS_PROVIDER, "BASIC");
+ * configProps.setProperty(AWSConfigConstants.AWS_ACCESS_KEY_ID, "your-access-key");
+ * configProps.setProperty(AWSConfigConstants.AWS_SECRET_ACCESS_KEY, "your-secret-key");
+ *
+ * // Validate the AWS configuration
+ * AWSGeneralUtil.validateAwsConfiguration(configProps);
+ *
+ * // Get the AWS credentials provider
+ * AwsCredentialsProvider credentialsProvider = AWSGeneralUtil.getCredentialsProvider(configProps);
+ *
+ * // Get the AWS region
+ * Region region = AWSGeneralUtil.getRegion(configProps);
+ *
+ * // Create an async HTTP client for AWS service calls
+ * SdkAsyncHttpClient httpClient = AWSGeneralUtil.createAsyncHttpClient(configProps);
+ * }</pre>
+ */
+@Internal
+public class AWSGeneralUtil {
+    private static final Logger LOG = LoggerFactory.getLogger(AWSGeneralUtil.class);
+
+    private static final Duration CONNECTION_ACQUISITION_TIMEOUT = Duration.ofSeconds(60);
+    private static final int INITIAL_WINDOW_SIZE_BYTES = 512 * 1024; // 512 KB
+    private static final Duration HEALTH_CHECK_PING_PERIOD = Duration.ofSeconds(60);
+
+    private static final int HTTP_CLIENT_MAX_CONCURRENCY = 10_000;
+    private static final Duration HTTP_CLIENT_READ_TIMEOUT = Duration.ofMinutes(6);
+    private static final Protocol HTTP_PROTOCOL = Protocol.HTTP2;
+    private static final boolean TRUST_ALL_CERTIFICATES = false;
+    private static final AttributeMap HTTP_CLIENT_DEFAULTS =
+            AttributeMap.builder()
+                    .put(SdkHttpConfigurationOption.MAX_CONNECTIONS, HTTP_CLIENT_MAX_CONCURRENCY)
+                    .put(SdkHttpConfigurationOption.READ_TIMEOUT, HTTP_CLIENT_READ_TIMEOUT)
+                    .put(SdkHttpConfigurationOption.TRUST_ALL_CERTIFICATES, TRUST_ALL_CERTIFICATES)
+                    .put(SdkHttpConfigurationOption.PROTOCOL, HTTP_PROTOCOL)
+                    .build();
+
+    /**
+     * Determines and returns the credential provider type from the given properties.
+     *
+     * <p>This method examines the configuration properties to determine which AWS credential
+     * provider type to use. If the credential provider type is not explicitly specified,
+     * it will default to:
+     * <ul>
+     *   <li>BASIC - if access key ID and secret key are provided</li>
+     *   <li>AUTO - if no credential information is provided</li>
+     * </ul>
+     *
+     * @param configProps The configuration properties
+     * @param configPrefix The configuration prefix for credential provider settings
+     *
+     * @return The credential provider type to use
+     *
+     * @throws IllegalArgumentException If the specified credential provider type is invalid
+     */
+    public static CredentialProvider getCredentialProviderType(
+            final Properties configProps, final String configPrefix) {
+        if (!configProps.containsKey(configPrefix)) {
+            if (configProps.containsKey(AWSConfigConstants.accessKeyId(configPrefix))
+                    && configProps.containsKey(AWSConfigConstants.secretKey(configPrefix))) {
+                // if the credential provider type is not specified, but the Access Key ID and
+                // Secret Key are given, it will default to BASIC
+                return CredentialProvider.BASIC;
+            } else {
+                // if the credential provider type is not specified, it will default to AUTO
+                return CredentialProvider.AUTO;
+            }
+        } else {
+            try {
+                return CredentialProvider.valueOf(configProps.getProperty(configPrefix));
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException(
+                        String.format(
+                                "Invalid AWS Credential Provider Type %s.",
+                                configProps.getProperty(configPrefix)),
+                        e);
+            }
+        }
+    }
+
+    /**
+     * Return a {@link AwsCredentialsProvider} instance corresponding to the configuration
+     * properties.
+     *
+     * <p>This method creates an AWS credentials provider based on the configuration properties.
+     * It supports various credential provider types including:
+     * <ul>
+     *   <li>Environment variables</li>
+     *   <li>System properties</li>
+     *   <li>AWS profile credentials</li>
+     *   <li>Basic credentials (access key ID and secret key)</li>
+     *   <li>IAM role assumption</li>
+     *   <li>Web identity token</li>
+     *   <li>Custom credential providers</li>
+     *   <li>Default credential provider chain</li>
+     * </ul>
+     *
+     * @param configProps The configuration property map
+     *
+     * @return The corresponding AWS Credentials Provider instance
+     */
+    public static AwsCredentialsProvider getCredentialsProvider(final Map<String, ?> configProps) {
+        Properties properties = new Properties();
+        properties.putAll(configProps);
+
+        return getCredentialsProvider(properties);
+    }
+
+    /**
+     * Return a {@link AwsCredentialsProvider} instance corresponding to the configuration
+     * properties.
+     *
+     * @param configProps the configuration properties
+     *
+     * @return The corresponding AWS Credentials Provider instance
+     */
+    public static AwsCredentialsProvider getCredentialsProvider(final Properties configProps) {
+        return getCredentialsProvider(configProps, AWSConfigConstants.AWS_CREDENTIALS_PROVIDER);
+    }
+
+    public static AwsCredentialsProvider getCredentialsProvider(
+            final Properties configProps, final String configPrefix) {
+        CredentialProvider credentialProviderType =
+                getCredentialProviderType(configProps, configPrefix);
+
+        switch (credentialProviderType) {
+            case ENV_VAR:
+                return EnvironmentVariableCredentialsProvider.create();
+
+            case SYS_PROP:
+                return SystemPropertyCredentialsProvider.create();
+
+            case CUSTOM:
+                return getCustomCredentialProvider(
+                        configProps,
+                        AWSConfigConstants.customCredentialsProviderClass(configPrefix));
+
+            case PROFILE:
+                return getProfileCredentialProvider(configProps, configPrefix);
+
+            case BASIC:
+                return () ->
+                        AwsBasicCredentials.create(
+                                configProps.getProperty(
+                                        AWSConfigConstants.accessKeyId(configPrefix)),
+                                configProps.getProperty(
+                                        AWSConfigConstants.secretKey(configPrefix)));
+
+            case ASSUME_ROLE:
+                return getAssumeRoleCredentialProvider(configProps, configPrefix);
+
+            case WEB_IDENTITY_TOKEN:
+                return getWebIdentityTokenFileCredentialsProvider(
+                        WebIdentityTokenFileCredentialsProvider.builder(),
+                        configProps,
+                        configPrefix);
+
+            case AUTO:
+                // Using builder instead of DefaultCredentialsProvider.create
+                // to get new instance for each call.
+                return DefaultCredentialsProvider.builder().build();
+
+            default:
+                throw new IllegalArgumentException(
+                        "Credential provider not supported: " + credentialProviderType);
+        }
+    }
+
+    /**
+     * Tries to instantiate the user's custom AWS credential provider class.
+     *
+     * @param conf Properties object that contains all the provided config and that we pass down to
+     *         the custom credential provider implementation's constructor
+     * @param confKey Config key we use to retrieve the credential provider class name specified by
+     *         the user
+     *
+     * @return an AwsCredentialsProvider object
+     *
+     * @throws ClassCastException if the specified class does not implement AwsCredentialsProvider
+     * @throws RuntimeException if the specified class does not exist or does not have a constructor
+     *         with signature `MyCustomCredentialsClass(Properties props)`.
+     */
+    public static AwsCredentialsProvider getCustomCredentialProvider(
+            final Properties conf, final String confKey) {
+        String configuredClass = conf.getProperty(confKey);
+        if (configuredClass == null) {
+            throw new RuntimeException(
+                    "No custom AWS credential provider class was provided with config key "
+                            + confKey);
+        }
+        try {
+            Class<?> customLoaderCls = Class.forName(configuredClass);
+            return (AwsCredentialsProvider)
+                    customLoaderCls.getDeclaredConstructor(Properties.class).newInstance(conf);
+        } catch (ClassNotFoundException | NoSuchMethodException e) {
+            LOG.error(
+                    "Failed to find the specified custom AWS credentials provider {} {}",
+                    e.getMessage(),
+                    e);
+            throw new RuntimeException(e);
+        } catch (InvocationTargetException | InstantiationException | IllegalAccessException e) {
+            LOG.error(
+                    "Failed to instantiate the specified custom AWS credentials provider {} {}",
+                    e.getMessage(),
+                    e);
+            throw new RuntimeException(e);
+        }
+    }
+
+    public static AwsCredentialsProvider getProfileCredentialProvider(
+            final Properties configProps, final String configPrefix) {
+        String profileName =
+                configProps.getProperty(AWSConfigConstants.profileName(configPrefix), null);
+
+        ProfileCredentialsProvider.Builder profileBuilder =
+                ProfileCredentialsProvider.builder().profileName(profileName);
+
+        Optional.ofNullable(configProps.getProperty(AWSConfigConstants.profilePath(configPrefix)))
+                .map(Paths::get)
+                .ifPresent(
+                        path ->
+                                profileBuilder.profileFile(
+                                        ProfileFile.builder()
+                                                .type(ProfileFile.Type.CREDENTIALS)
+                                                .content(path)
+                                                .build()));
+
+        return profileBuilder.build();
+    }
+
+    private static AwsCredentialsProvider getAssumeRoleCredentialProvider(
+            final Properties configProps, final String configPrefix) {
+        final StsClientBuilder stsClientBuilder =
+                StsClient.builder()
+                        .credentialsProvider(
+                                getCredentialsProvider(
+                                        configProps,
+                                        AWSConfigConstants.roleCredentialsProvider(configPrefix)))
+                        .region(getRegion(configProps));
+        Optional.ofNullable(getStsEndpoint(configProps))
+                .ifPresent(stsClientBuilder::endpointOverride);
+
+        return StsAssumeRoleCredentialsProvider.builder()
+                .refreshRequest(
+                        AssumeRoleRequest.builder()
+                                .roleArn(
+                                        configProps.getProperty(
+                                                AWSConfigConstants.roleArn(configPrefix)))
+                                .roleSessionName(
+                                        configProps.getProperty(
+                                                AWSConfigConstants.roleSessionName(configPrefix)))
+                                .externalId(
+                                        configProps.getProperty(
+                                                AWSConfigConstants.externalId(configPrefix)))
+                                .build())
+                .stsClient(stsClientBuilder.build())
+                .build();
+    }
+
+    @VisibleForTesting
+    static AwsCredentialsProvider getWebIdentityTokenFileCredentialsProvider(
+            final WebIdentityTokenFileCredentialsProvider.Builder webIdentityBuilder,
+            final Properties configProps,
+            final String configPrefix) {
+
+        Optional.ofNullable(configProps.getProperty(AWSConfigConstants.roleArn(configPrefix)))
+                .ifPresent(webIdentityBuilder::roleArn);
+
+        Optional.ofNullable(
+                        configProps.getProperty(AWSConfigConstants.roleSessionName(configPrefix)))
+                .ifPresent(webIdentityBuilder::roleSessionName);
+
+        Optional.ofNullable(
+                        configProps.getProperty(
+                                AWSConfigConstants.webIdentityTokenFile(configPrefix)))
+                .map(Paths::get)
+                .ifPresent(webIdentityBuilder::webIdentityTokenFile);
+
+        return webIdentityBuilder.build();
+    }
+
+    /**
+     * Creates an asynchronous HTTP client for AWS service calls.
+     *
+     * <p>This method creates an HTTP client with optimized settings for AWS service
+     * interactions, including:
+     * <ul>
+     *   <li>Connection pooling and management</li>
+     *   <li>TCP keep-alive</li>
+     *   <li>HTTP/2 support</li>
+     *   <li>Configurable timeouts and concurrency limits</li>
+     *   <li>Health check pings</li>
+     * </ul>
+     *
+     * @param configProperties The configuration properties for the HTTP client
+     *
+     * @return A configured asynchronous HTTP client
+     */
+    public static SdkAsyncHttpClient createAsyncHttpClient(final Properties configProperties) {
+        return createAsyncHttpClient(configProperties, NettyNioAsyncHttpClient.builder());
+    }
+
+    @VisibleForTesting
+    static AttributeMap getSdkHttpConfigurationOptions(final Properties configProperties) {
+        final AttributeMap.Builder clientConfiguration =
+                AttributeMap.builder().put(SdkHttpConfigurationOption.TCP_KEEPALIVE, true);
+
+        Optional.ofNullable(
+                        configProperties.getProperty(
+                                AWSConfigConstants.HTTP_CLIENT_MAX_CONCURRENCY))
+                .map(Integer::parseInt)
+                .ifPresent(
+                        integer ->
+                                clientConfiguration.put(
+                                        SdkHttpConfigurationOption.MAX_CONNECTIONS, integer));
+
+        Optional.ofNullable(
+                        configProperties.getProperty(
+                                AWSConfigConstants.HTTP_CLIENT_READ_TIMEOUT_MILLIS))
+                .map(Integer::parseInt)
+                .map(Duration::ofMillis)
+                .ifPresent(
+                        timeout ->
+                                clientConfiguration.put(
+                                        SdkHttpConfigurationOption.READ_TIMEOUT, timeout));
+
+        Optional.ofNullable(configProperties.getProperty(AWSConfigConstants.TRUST_ALL_CERTIFICATES))
+                .map(Boolean::parseBoolean)
+                .ifPresent(
+                        bool ->
+                                clientConfiguration.put(
+                                        SdkHttpConfigurationOption.TRUST_ALL_CERTIFICATES, bool));
+
+        Optional.ofNullable(configProperties.getProperty(AWSConfigConstants.HTTP_PROTOCOL_VERSION))
+                .map(Protocol::valueOf)
+                .ifPresent(
+                        protocol ->
+                                clientConfiguration.put(
+                                        SdkHttpConfigurationOption.PROTOCOL, protocol));
+
+        return clientConfiguration.build();
+    }
+
+    public static SdkAsyncHttpClient createAsyncHttpClient(
+            final Properties configProperties,
+            final NettyNioAsyncHttpClient.Builder httpClientBuilder) {
+        return createAsyncHttpClient(
+                getSdkHttpConfigurationOptions(configProperties), httpClientBuilder);
+    }
+
+    public static SdkAsyncHttpClient createAsyncHttpClient(
+            final NettyNioAsyncHttpClient.Builder httpClientBuilder) {
+        return createAsyncHttpClient(AttributeMap.empty(), httpClientBuilder);
+    }
+
+    public static SdkAsyncHttpClient createAsyncHttpClient(
+            final AttributeMap config, final NettyNioAsyncHttpClient.Builder httpClientBuilder) {
+        httpClientBuilder
+                .connectionAcquisitionTimeout(CONNECTION_ACQUISITION_TIMEOUT)
+                .http2Configuration(
+                        Http2Configuration.builder()
+                                .healthCheckPingPeriod(HEALTH_CHECK_PING_PERIOD)
+                                .initialWindowSize(INITIAL_WINDOW_SIZE_BYTES)
+                                .build());
+        return httpClientBuilder.buildWithDefaults(config.merge(HTTP_CLIENT_DEFAULTS));
+    }
+
+    public static SdkHttpClient createSyncHttpClient(
+            final Properties configProperties, final ApacheHttpClient.Builder httpClientBuilder) {
+        return createSyncHttpClient(
+                getSdkHttpConfigurationOptions(configProperties), httpClientBuilder);
+    }
+
+    public static SdkHttpClient createSyncHttpClient(
+            final AttributeMap config, final ApacheHttpClient.Builder httpClientBuilder) {
+        httpClientBuilder.connectionAcquisitionTimeout(CONNECTION_ACQUISITION_TIMEOUT);
+        return httpClientBuilder.buildWithDefaults(config.merge(HTTP_CLIENT_DEFAULTS));
+    }
+
+    /**
+     * Extract region from resource ARN.
+     *
+     * @param arn resource ARN
+     *
+     * @return An {@link Optional} containing region name (e.g. us-east-1), or an empty {@link
+     *         Optional} if ARN does not contain region component
+     */
+    public static Optional<String> getRegionFromArn(final String arn) {
+        return Arn.fromString(arn).region();
+    }
+
+    /**
+     * Creates a {@link Region} object from the given Properties.
+     *
+     * @param configProps the properties containing the region
+     *
+     * @return the region specified by the properties
+     */
+    public static Region getRegion(final Properties configProps) {
+        return Region.of(configProps.getProperty(
+                AWSConfigConstants.AWS_REGION,
+                AWSConfigOptions.AWS_REGION_OPTION.defaultValue()));
+    }
+
+    /**
+     * Creates STS endpoint URI object from the given Properties.
+     *
+     * @param configProps the properties containing the endpoint
+     *
+     * @return STS endpoint URI specified by the properties, or {@code null} if endpoint not
+     *         specified
+     */
+    public static URI getStsEndpoint(final Properties configProps) {
+        return Optional.ofNullable(
+                        configProps.getProperty(AWSConfigConstants.AWS_ROLE_STS_ENDPOINT))
+                .map(URI::create)
+                .orElse(null);
+    }
+
+    /**
+     * Checks whether or not a region is valid.
+     *
+     * @param region The AWS region to check
+     *
+     * @return true if the supplied region is valid, false otherwise
+     */
+    public static boolean isValidRegion(Region region) {
+        return Pattern.matches(
+                "^[a-z]+-([a-z]+[-]{0,1}[a-z]+-([0-9]|global)|global)$", region.id());
+    }
+
+    /**
+     * Validates configuration properties related to Amazon AWS service.
+     *
+     * @param config the properties to setup credentials and region
+     */
+    public static void validateAwsConfiguration(Properties config) {
+        if (config.containsKey(AWSConfigConstants.AWS_CREDENTIALS_PROVIDER)) {
+
+            validateCredentialProvider(config);
+            // if BASIC type is used, also check that the Access Key ID and Secret Key is supplied
+            CredentialProvider credentialsProviderType =
+                    getCredentialProviderType(config, AWSConfigConstants.AWS_CREDENTIALS_PROVIDER);
+            if (credentialsProviderType == CredentialProvider.BASIC) {
+                if (!config.containsKey(AWSConfigConstants.AWS_ACCESS_KEY_ID)
+                        || !config.containsKey(AWSConfigConstants.AWS_SECRET_ACCESS_KEY)) {
+                    throw new IllegalArgumentException(
+                            "Please set values for AWS Access Key ID ('"
+                                    + AWSConfigConstants.AWS_ACCESS_KEY_ID
+                                    + "') "
+                                    + "and Secret Key ('"
+                                    + AWSConfigConstants.AWS_SECRET_ACCESS_KEY
+                                    + "') when using the BASIC AWS credential provider type.");
+                }
+            }
+        }
+
+        if (config.containsKey(AWSConfigConstants.AWS_REGION)) {
+            // specified AWS Region name must be recognizable
+            if (!isValidRegion(getRegion(config))) {
+                StringBuilder sb = new StringBuilder();
+                for (Region region : Region.regions()) {
+                    sb.append(region).append(", ");
+                }
+                throw new IllegalArgumentException(
+                        "Invalid AWS region set in config. Valid values are: " + sb.toString());
+            }
+        }
+    }
+
+    public static void closeResources(SdkAutoCloseable... resources) {
+        RuntimeException exception = null;
+        for (SdkAutoCloseable resource : resources) {
+            if (resource != null) {
+                try {
+                    resource.close();
+                } catch (RuntimeException e) {
+                    exception = ExceptionUtils.firstOrSuppressed(e, exception);
+                }
+            }
+        }
+        if (exception != null) {
+            throw exception;
+        }
+    }
+
+    public static void validateAwsCredentials(Properties config) {
+        validateAwsConfiguration(config);
+        getCredentialsProvider(config).resolveCredentials();
+    }
+
+    private static void validateCredentialProvider(Properties config) {
+        // value specified for AWSConfigConstants.AWS_CREDENTIALS_PROVIDER needs to be
+        // recognizable
+        try {
+            getCredentialsProvider(config);
+        } catch (IllegalArgumentException e) {
+            StringBuilder sb = new StringBuilder();
+            for (CredentialProvider type : CredentialProvider.values()) {
+                sb.append(type.toString()).append(", ");
+            }
+            throw new IllegalArgumentException(
+                    "Invalid AWS Credential Provider Type set in config. Valid values are: "
+                            + sb.toString());
+        }
+    }
+}
